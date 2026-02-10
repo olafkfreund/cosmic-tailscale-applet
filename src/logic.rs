@@ -1,6 +1,8 @@
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde_json::Value;
 use tokio::process::Command;
 use tracing::{debug, error, warn};
 
@@ -28,6 +30,30 @@ pub struct TailscaleState {
   pub current_acct: String,
 }
 
+/// Parsed preferences from `tailscale debug prefs`.
+#[allow(clippy::struct_excessive_bools)]
+struct TailscalePrefs {
+  want_running: bool,
+  run_ssh: bool,
+  route_all: bool,
+  is_exit_node: bool,
+}
+
+/// Fetch all preferences from a single `tailscale debug prefs` call.
+async fn fetch_tailscale_prefs() -> Result<TailscalePrefs, AppError> {
+  let output = run_tailscale_cmd(&["debug", "prefs"]).await?;
+  let prefs: Value = serde_json::from_str(&output)?;
+
+  Ok(TailscalePrefs {
+    want_running: prefs.get("WantRunning").and_then(Value::as_bool).unwrap_or(false),
+    run_ssh: prefs.get("RunSSH").and_then(Value::as_bool).unwrap_or(false),
+    route_all: prefs.get("RouteAll").and_then(Value::as_bool).unwrap_or(false),
+    is_exit_node: prefs
+      .get("AdvertiseRoutes")
+      .is_some_and(|v| !v.is_null() && v.as_str() != Some("")),
+  })
+}
+
 /// Fetch all Tailscale state in one async batch.
 pub async fn fetch_tailscale_state() -> Result<TailscaleState, AppError> {
   let ip = get_tailscale_ip().await.unwrap_or_else(|e| {
@@ -35,20 +61,23 @@ pub async fn fetch_tailscale_state() -> Result<TailscaleState, AppError> {
     fl!("not-available")
   });
 
-  let connected = get_tailscale_con_status().await.unwrap_or(false);
-  let ssh_enabled = get_tailscale_ssh_status().await.unwrap_or(false);
-  let routes_enabled = get_tailscale_routes_status().await.unwrap_or(false);
-  let is_exit_node = get_is_exit_node().await.unwrap_or(false);
+  let prefs = fetch_tailscale_prefs().await.unwrap_or_else(|e| {
+    warn!("Failed to fetch prefs: {e}");
+    TailscalePrefs {
+      want_running: false,
+      run_ssh: false,
+      route_all: false,
+      is_exit_node: false,
+    }
+  });
 
   let devices = get_tailscale_devices().await.unwrap_or_else(|e| {
     warn!("Failed to get devices: {e}");
     vec!["Select".to_string()]
   });
 
-  let exit_nodes = if is_exit_node {
-    vec![String::from(
-      "Can't select an exit node\nwhile host is an exit node!",
-    )]
+  let exit_nodes = if prefs.is_exit_node {
+    vec![fl!("exit-node-is-host")]
   } else {
     get_avail_exit_nodes().await.unwrap_or_else(|e| {
       warn!("Failed to get exit nodes: {e}");
@@ -61,10 +90,10 @@ pub async fn fetch_tailscale_state() -> Result<TailscaleState, AppError> {
 
   Ok(TailscaleState {
     ip,
-    connected,
-    ssh_enabled,
-    routes_enabled,
-    is_exit_node,
+    connected: prefs.want_running,
+    ssh_enabled: prefs.run_ssh,
+    routes_enabled: prefs.route_all,
+    is_exit_node: prefs.is_exit_node,
     devices,
     exit_nodes,
     acct_list,
@@ -72,55 +101,34 @@ pub async fn fetch_tailscale_state() -> Result<TailscaleState, AppError> {
   })
 }
 
-/// Get the IPv4 address assigned to this computer.
-pub async fn get_tailscale_ip() -> Result<String, AppError> {
-  let ip_cmd = Command::new("tailscale")
-    .args(["ip", "-4"])
+/// Run a tailscale CLI command and return stdout, checking the exit code.
+async fn run_tailscale_cmd(args: &[&str]) -> Result<String, AppError> {
+  let output = Command::new("tailscale")
+    .args(args)
     .output()
     .await?;
 
-  let ip = String::from_utf8(ip_cmd.stdout)?;
+  if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    return Err(AppError::CliFailure(format!(
+      "tailscale {} exited with {}: {}",
+      args.join(" "),
+      output.status,
+      stderr.trim()
+    )));
+  }
+
+  Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Get the IPv4 address assigned to this computer.
+pub async fn get_tailscale_ip() -> Result<String, AppError> {
+  let ip = run_tailscale_cmd(&["ip", "-4"]).await?;
   Ok(ip.trim().to_string())
 }
 
-/// Get a preference value from `tailscale debug prefs`.
-async fn get_tailscale_pref(key: &str) -> Result<bool, AppError> {
-  let prefs_cmd = Command::new("tailscale")
-    .args(["debug", "prefs"])
-    .output()
-    .await?;
-
-  let output = String::from_utf8(prefs_cmd.stdout)?;
-  let line = output
-    .lines()
-    .find(|line| line.contains(key))
-    .unwrap_or("");
-
-  Ok(line.contains("true"))
-}
-
-/// Get Tailscale's connection status
-pub async fn get_tailscale_con_status() -> Result<bool, AppError> {
-  get_tailscale_pref("WantRunning").await
-}
-
-/// Get the current status of the SSH enablement
-pub async fn get_tailscale_ssh_status() -> Result<bool, AppError> {
-  get_tailscale_pref("RunSSH").await
-}
-
-/// Get the current status of the accept-routes enablement
-pub async fn get_tailscale_routes_status() -> Result<bool, AppError> {
-  get_tailscale_pref("RouteAll").await
-}
-
 pub async fn get_tailscale_devices() -> Result<Vec<String>, AppError> {
-  let ts_status_cmd = Command::new("tailscale")
-    .arg("status")
-    .output()
-    .await?;
-
-  let out = String::from_utf8(ts_status_cmd.stdout)?;
+  let out = run_tailscale_cmd(&["status"]).await?;
 
   let mut devices: Vec<String> = out
     .lines()
@@ -139,71 +147,64 @@ pub async fn get_tailscale_devices() -> Result<Vec<String>, AppError> {
 /// Set the Tailscale connection up/down
 pub async fn tailscale_int_up(up: bool) -> Result<(), AppError> {
   let arg = if up { "up" } else { "down" };
-  Command::new("tailscale").arg(arg).output().await?;
+  run_tailscale_cmd(&[arg]).await?;
   Ok(())
 }
 
 /// Send files through Tail Drop
-pub async fn tailscale_send(file_paths: Vec<Option<String>>, target: &str) -> Option<String> {
+pub async fn tailscale_send(file_paths: &[PathBuf], target: &str) -> Option<String> {
   let mut errors = Vec::new();
 
-  for path in &file_paths {
-    match path {
-      Some(p) => {
-        match Command::new("tailscale")
-          .args(["file", "cp", p, &format!("{target}:")])
-          .output()
-          .await
-        {
-          Ok(output) => {
-            if !output.stderr.is_empty() {
-              let err = String::from_utf8_lossy(&output.stderr).to_string();
-              warn!("Error sending file {p}: {err}");
-              errors.push(err);
-            }
-          }
-          Err(e) => {
-            error!("Failed to execute tailscale file cp: {e}");
-            errors.push(format!("Failed to send {p}: {e}"));
-          }
+  for path in file_paths {
+    let p = path.to_string_lossy();
+    match Command::new("tailscale")
+      .args(["file", "cp", &*p, &format!("{target}:")])
+      .output()
+      .await
+    {
+      Ok(output) => {
+        if !output.status.success() || !output.stderr.is_empty() {
+          let err = String::from_utf8_lossy(&output.stderr).to_string();
+          warn!("Error sending file {p}: {err}");
+          errors.push(err);
         }
       }
-      None => {
-        return Some(String::from(
-          "Something went wrong sending the file!\nPossible bad file path!",
-        ));
+      Err(e) => {
+        error!("Failed to execute tailscale file cp: {e}");
+        errors.push(format!("Failed to send {p}: {e}"));
       }
     }
   }
 
   if !errors.is_empty() {
-    return Some("One or more files were not sent successfully!".to_string());
+    return Some(fl!("send-files-partial-fail"));
   }
 
   None
 }
 
-/// Receive files through Tail Drop
+/// Receive files through Tail Drop (with 30-second timeout).
 pub async fn tailscale_receive() -> String {
   let Some(download_path) = dirs::download_dir() else {
-    return "Could not determine Downloads directory!".to_string();
+    return fl!("no-downloads-dir");
   };
 
   let download_str = download_path.to_string_lossy().to_string();
 
-  match Command::new("tailscale")
+  let receive_fut = Command::new("tailscale")
     .args(["file", "get", &download_str])
-    .output()
-    .await
-  {
-    Ok(output) => {
-      if output.stderr.is_empty() {
-        "Received file(s) in Downloads!".to_string()
+    .output();
+
+  match tokio::time::timeout(std::time::Duration::from_secs(30), receive_fut).await {
+    Ok(Ok(output)) => {
+      if output.status.success() && output.stderr.is_empty() {
+        fl!("received-files-success")
       } else {
         String::from_utf8_lossy(&output.stderr).to_string()
       }
     }
-    Err(e) => format!("Failed to receive files: {e}"),
+    Ok(Err(e)) => format!("Failed to receive files: {e}"),
+    Err(_) => String::from("No files received (timed out after 30s)"),
   }
 }
 
@@ -220,16 +221,7 @@ async fn set_tailscale_flag(flag: &str, enabled: bool) -> Result<(), AppError> {
     format!("--{flag}=false")
   };
 
-  let output = Command::new("tailscale")
-    .args(["set", &value])
-    .output()
-    .await?;
-
-  if !output.stderr.is_empty() {
-    let err = String::from_utf8_lossy(&output.stderr).to_string();
-    warn!("Error setting {flag} to {enabled}: {err}");
-  }
-
+  run_tailscale_cmd(&["set", &value]).await?;
   Ok(())
 }
 
@@ -245,56 +237,25 @@ pub async fn set_routes(accept_routes: bool) -> Result<(), AppError> {
 
 /// Make current host an exit node
 pub async fn enable_exit_node(is_exit_node: bool) -> Result<(), AppError> {
-  Command::new("tailscale")
-    .args(["set", &format!("--advertise-exit-node={is_exit_node}")])
-    .output()
-    .await?;
-
+  let flag = format!("--advertise-exit-node={is_exit_node}");
+  run_tailscale_cmd(&["set", &flag]).await?;
   tailscale_int_up(true).await
-}
-
-/// Get the status of whether or not the host is an exit node
-pub async fn get_is_exit_node() -> Result<bool, AppError> {
-  let output = Command::new("tailscale")
-    .args(["debug", "prefs"])
-    .output()
-    .await?;
-
-  let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-  let adv_rts = stdout
-    .lines()
-    .filter(|line| line.to_lowercase().contains("advertiseroutes"))
-    .flat_map(|line| line.chars())
-    .collect::<String>();
-
-  Ok(!adv_rts.contains("null") && !adv_rts.is_empty())
 }
 
 /// Add/remove exit node's access to the host's local LAN
 pub async fn exit_node_allow_lan_access(is_allowed: bool) -> Result<(), AppError> {
-  Command::new("tailscale")
-    .args([
-      "set",
-      &format!("--exit-node-allow-lan-access={is_allowed}"),
-    ])
-    .output()
-    .await?;
-
+  let flag = format!("--exit-node-allow-lan-access={is_allowed}");
+  run_tailscale_cmd(&["set", &flag]).await?;
   Ok(())
 }
 
 /// Get available exit nodes
 pub async fn get_avail_exit_nodes() -> Result<Vec<String>, AppError> {
-  let exit_node_list_cmd = Command::new("tailscale")
-    .args(["exit-node", "list"])
-    .output()
-    .await?;
-
-  let exit_node_list_string = String::from_utf8(exit_node_list_cmd.stdout)?;
+  let exit_node_list_string = run_tailscale_cmd(&["exit-node", "list"]).await?;
 
   if exit_node_list_string.is_empty() {
     debug!("No exit nodes found");
-    return Ok(vec!["No exit nodes found!".to_string()]);
+    return Ok(vec![fl!("no-exit-nodes")]);
   }
 
   let mut exit_node_list: Vec<String> = vec!["None".to_string()];
@@ -317,63 +278,38 @@ pub async fn get_avail_exit_nodes() -> Result<Vec<String>, AppError> {
 
 /// Set selected exit node as the exit node through Tailscale CLI
 pub async fn set_exit_node(exit_node: &str) -> Result<(), AppError> {
-  Command::new("tailscale")
-    .args(["set", &format!("--exit-node={exit_node}")])
-    .output()
-    .await?;
-
+  let flag = format!("--exit-node={exit_node}");
+  run_tailscale_cmd(&["set", &flag]).await?;
   Ok(())
 }
 
 pub async fn switch_accounts(acct_name: &str) -> Result<bool, AppError> {
-  let cmd = Command::new("tailscale")
-    .args(["switch", acct_name])
-    .output()
-    .await?;
-
-  let success = String::from_utf8(cmd.stdout)?;
-  Ok(success.to_lowercase().contains("success"))
+  let output = run_tailscale_cmd(&["switch", acct_name]).await?;
+  Ok(output.to_lowercase().contains("success"))
 }
 
 pub async fn get_acct_list() -> Result<Vec<String>, AppError> {
-  let accts = Command::new("tailscale")
-    .args(["switch", "--list"])
-    .output()
-    .await?;
+  let accts_str = run_tailscale_cmd(&["switch", "--list"]).await?;
 
-  let accts_str = String::from_utf8_lossy(&accts.stdout).to_string();
-
-  let tailnets: Vec<String> = accts_str
+  let ret_accts: Vec<String> = accts_str
     .lines()
     .filter(|line| !line.to_lowercase().starts_with("id"))
-    .map(std::string::ToString::to_string)
-    .collect();
-
-  let ret_accts: Vec<String> = tailnets
-    .iter()
     .filter_map(|acct| acct.split_whitespace().nth(1).map(std::string::ToString::to_string))
     .collect();
 
   Ok(ret_accts)
 }
 
+/// Get the current account name from `tailscale status --json`.
 pub async fn get_current_acct() -> Result<String, AppError> {
-  let cmd = Command::new("tailscale")
-    .args(["status", "--json"])
-    .output()
-    .await?;
+  let output = run_tailscale_cmd(&["status", "--json"]).await?;
+  let status: Value = serde_json::from_str(&output)?;
 
-  let output = String::from_utf8_lossy(&cmd.stdout).to_string();
-
-  let acct = output
-    .lines()
-    .filter(|line| line.trim().starts_with("\"Name\""))
-    .find_map(|line| {
-      line
-        .split_whitespace()
-        .last()
-        .map(|s| s.replace(['"', ','], ""))
-    })
+  let acct = status
+    .get("Self")
+    .and_then(|s| s.get("DNSName"))
+    .and_then(Value::as_str)
+    .map(|dns| dns.trim_end_matches('.').to_string())
     .unwrap_or_default();
 
   Ok(acct)

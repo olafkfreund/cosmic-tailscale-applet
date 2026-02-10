@@ -77,7 +77,7 @@ vendor:
     echo '[env]' >> .cargo/config.toml
     if [ -n "${SOURCE_DATE_EPOCH}" ]
     then
-        source_date="$date -d "@${SOURCE_DATE_EPOCH}" "+%Y-%m-%d")"
+        source_date="$(date -d "@${SOURCE_DATE_EPOCH}" "+%Y-%m-%d")"
         echo "VERGEN_GIT_COMMIT_DATE = \"${source_date}\"" >> .cargo/config.toml
     fi
     if [ -n "${SOURCE_GIT_HASH}" ]

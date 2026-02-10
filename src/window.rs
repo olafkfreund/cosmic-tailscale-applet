@@ -48,7 +48,7 @@ pub struct Window {
   device_options: Vec<String>,
   selected_device: String,
   selected_device_idx: Option<usize>,
-  send_files: Vec<Option<String>>,
+  send_files: Vec<PathBuf>,
   send_file_status: String,
   files_sent: bool,
   receive_file_status: String,
@@ -318,18 +318,12 @@ impl cosmic::Application for Window {
       }
       Message::FilesSelected(urls) => {
         for url in &urls {
-          let path = match url.to_file_path() {
-            Ok(good_path) => good_path,
-            Err(_e) => PathBuf::new(),
-          };
-
-          if path.exists() {
-            self.send_files.push(
-              path
-                .as_path()
-                .to_str()
-                .map(String::from),
-            );
+          if let Ok(path) = url.to_file_path() {
+            if path.exists() {
+              self.send_files.push(path);
+            }
+          } else {
+            warn!("Invalid file URL: {url}");
           }
         }
 
@@ -343,7 +337,7 @@ impl cosmic::Application for Window {
         if dev != "Select" {
           self.files_sent = true;
           return cosmic::task::future(async move {
-            let tx_status = tailscale_send(files, &dev).await;
+            let tx_status = tailscale_send(&files, &dev).await;
             Message::FilesSent(tx_status)
           });
         }

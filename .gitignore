@@ -15,3 +15,6 @@ repo/
 # Archives
 *.flatpak
 *.tar.gz
+
+# Nix
+result

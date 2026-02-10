@@ -1,5 +1,5 @@
 name := 'gui-scale-applet'
-export APPID := 'com.bhh32.GUIScaleApplet'
+export APPID := 'com.github.bhh32.GUIScaleApplet'
 rootdir := ''
 prefix := '/usr'
 base-dir := absolute_path(clean(rootdir / prefix))

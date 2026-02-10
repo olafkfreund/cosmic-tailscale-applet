@@ -1,5 +1,7 @@
 # GUI Scale COSMIC Desktop Applet
 
+> **Fork Notice:** This is a fork of [gui-scale-applet](https://github.com/cosmic-utils/gui-scale-applet) originally created by [Bryan Hyland (@bhh32)](https://github.com/bhh32). Thank you Bryan for building this applet and making Tailscale management on COSMIC Desktop a reality. This fork adds async CLI operations, structured error handling, internationalization, code quality improvements, and NixOS packaging.
+
 A Tailscale VPN management applet for the [COSMIC Desktop Environment](https://github.com/pop-os/cosmic-epoch) by System76. Built with Rust and [libcosmic](https://github.com/pop-os/libcosmic).
 
 **App ID:** `com.github.bhh32.GUIScaleApplet`
